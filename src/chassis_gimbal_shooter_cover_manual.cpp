@@ -9,9 +9,13 @@ namespace rm_manual
 ChassisGimbalShooterCoverManual::ChassisGimbalShooterCoverManual(ros::NodeHandle& nh, ros::NodeHandle& nh_referee)
   : ChassisGimbalShooterManual(nh, nh_referee)
 {
+  wheel_online_sub_ = nh.subscribe<rm_ecat_msgs::RmEcatStandardSlaveReadings>(
+      "/rm_ecat_hw/rm_readings", 10, &ChassisGimbalShooterCoverManual::wheelsOnlineCallback, this);
   ros::NodeHandle cover_nh(nh, "cover");
   nh.param("supply_frame", supply_frame_, std::string("supply_frame"));
   cover_command_sender_ = new rm_common::JointPositionBinaryCommandSender(cover_nh);
+  ros::NodeHandle wireless_nh(nh, "wireless");
+  nh.param("wireless_frame", wireless_frame_, std::string("wireless_frame"));
   ros::NodeHandle buff_switch_nh(nh, "buff_switch");
   switch_buff_srv_ = new rm_common::SwitchDetectionCaller(buff_switch_nh);
   ros::NodeHandle buff_type_switch_nh(nh, "buff_type_switch");
@@ -31,9 +35,22 @@ ChassisGimbalShooterCoverManual::ChassisGimbalShooterCoverManual(ros::NodeHandle
 
   ctrl_z_event_.setEdge(boost::bind(&ChassisGimbalShooterCoverManual::ctrlZPress, this),
                         boost::bind(&ChassisGimbalShooterCoverManual::ctrlZRelease, this));
+  ctrl_x_event_.setRising(boost::bind(&ChassisGimbalShooterCoverManual::ctrlXPress, this));
   ctrl_r_event_.setActiveHigh(boost::bind(&ChassisGimbalShooterCoverManual::ctrlRPressing, this));
-  z_event_.setEdge(boost::bind(&ChassisGimbalShooterCoverManual::zPress, this),
-                   boost::bind(&ChassisGimbalShooterCoverManual::zRelease, this));
+  e_event_.setEdge(boost::bind(&ChassisGimbalShooterCoverManual::ePress, this),
+                   boost::bind(&ChassisGimbalShooterCoverManual::eRelease, this));
+  q_event_.setRising(boost::bind(&ChassisGimbalShooterCoverManual::qPress, this));
+  z_event_.setRising(boost::bind(&ChassisGimbalShooterCoverManual::zPress, this));
+
+  XmlRpc::XmlRpcValue xml;
+  if (!nh.getParam("chassis_motor", xml))
+    ROS_ERROR("chassis_motor no defined (namespace: %s)", nh.getNamespace().c_str());
+  else
+  {
+    for (int i = 0; i < xml.size(); i++)
+      chassis_motor_.push_back(xml[i]);
+    wheels_online_state_.resize(chassis_motor_.size(), true);
+  }
 }
 
 void ChassisGimbalShooterCoverManual::changeSpeedMode(SpeedMode speed_mode)
@@ -84,11 +101,28 @@ void ChassisGimbalShooterCoverManual::changeGyroSpeedMode(SpeedMode speed_mode)
   }
 }
 
+void ChassisGimbalShooterCoverManual::checkWheelsOnline()
+{
+  bool all_wheels_online = true;
+  if (ros::Time::now() - last_check_wheels_time_ < ros::Duration(3.0))
+  {
+    for (auto wheel_status : wheels_online_state_)
+    {
+      if (!wheel_status)
+        all_wheels_online = false;
+    }
+  }
+  if (!all_wheels_online)
+    wheels_offline_ = true;
+  else if (wheels_offline_)
+    wheels_offline_ = false;
+}
+
 void ChassisGimbalShooterCoverManual::updatePc(const rm_msgs::DbusData::ConstPtr& dbus_data)
 {
   ChassisGimbalShooterManual::updatePc(dbus_data);
   gimbal_cmd_sender_->setRate(-dbus_data->m_x * gimbal_scale_,
-                              cover_command_sender_->getState() ? 0.0 : dbus_data->m_y * gimbal_scale_);
+                              cover_command_sender_->getState() ? 0.0 : -dbus_data->m_y * gimbal_scale_);
   if (is_gyro_)
   {
     if (switch_buff_srv_->getTarget() != rm_msgs::StatusChangeRequest::ARMOR)
@@ -114,12 +148,27 @@ void ChassisGimbalShooterCoverManual::checkReferee()
   else
     manual_to_referee_pub_data_.det_target = switch_detection_srv_->getTarget();
   ChassisGimbalShooterManual::checkReferee();
+  checkWheelsOnline();
 }
+
 void ChassisGimbalShooterCoverManual::checkKeyboard(const rm_msgs::DbusData::ConstPtr& dbus_data)
 {
   ChassisGimbalShooterManual::checkKeyboard(dbus_data);
   ctrl_z_event_.update(dbus_data->key_ctrl & dbus_data->key_z);
-  z_event_.update((!dbus_data->key_ctrl) & dbus_data->key_z);
+}
+
+void ChassisGimbalShooterCoverManual::wheelsOnlineCallback(
+    const rm_ecat_msgs::RmEcatStandardSlaveReadings::ConstPtr& data)
+{
+  updateWheelsState(data, chassis_motor_);
+}
+
+void ChassisGimbalShooterCoverManual::gameRobotStatusCallback(const rm_msgs::GameRobotStatus::ConstPtr& data)
+{
+  ChassisGimbalShooterManual::gameRobotStatusCallback(data);
+  if (data->mains_power_chassis_output - last_power_chassis_output_ == 1)
+    last_check_wheels_time_ = ros::Time::now();
+  last_power_chassis_output_ = data->mains_power_chassis_output;
 }
 
 void ChassisGimbalShooterCoverManual::sendCommand(const ros::Time& time)
@@ -167,9 +216,36 @@ void ChassisGimbalShooterCoverManual::sendCommand(const ros::Time& time)
         ROS_WARN("%s", ex.what());
       }
     }
+    if (need_wireless_)
+    {
+      chassis_cmd_sender_->getMsg()->follow_source_frame = wireless_frame_;
+      chassis_cmd_sender_->setMode(rm_msgs::ChassisCmd::FOLLOW);
+    }
+    else
+      chassis_cmd_sender_->getMsg()->follow_source_frame = "yaw";
   }
   ChassisGimbalShooterManual::sendCommand(time);
   cover_command_sender_->sendCommand(time);
+}
+
+void ChassisGimbalShooterCoverManual::updateWheelsState(const rm_ecat_msgs::RmEcatStandardSlaveReadings::ConstPtr& data,
+                                                        const std::vector<std::string>& chassis_motor)
+{
+  std::unordered_map<std::string, size_t> wheel_index_map;
+  for (size_t i = 0; i < chassis_motor.size(); ++i)
+    wheel_index_map[chassis_motor[i]] = i;
+
+  for (const auto& reading : data->readings)
+  {
+    for (size_t i = 0; i < reading.names.size(); ++i)
+    {
+      const auto& name = reading.names[i];
+      const auto it = wheel_index_map.find(name);
+      if (it == wheel_index_map.end())
+        continue;
+      wheels_online_state_[it->second] = reading.isOnline[i];
+    }
+  }
 }
 
 void ChassisGimbalShooterCoverManual::rightSwitchDownRise()
@@ -192,49 +268,55 @@ void ChassisGimbalShooterCoverManual::rightSwitchUpRise()
 
 void ChassisGimbalShooterCoverManual::ePress()
 {
-  switch_buff_srv_->switchTargetType();
-  switch_detection_srv_->switchTargetType();
-  switch_buff_type_srv_->setTargetType(switch_buff_srv_->getTarget());
-  switch_exposure_srv_->switchTargetType();
+  switch_buff_srv_->setTargetType(rm_msgs::StatusChangeRequest::SMALL_BUFF);
+  switch_detection_srv_->setTargetType(rm_msgs::StatusChangeRequest::SMALL_BUFF);
+  switch_buff_type_srv_->setTargetType(rm_msgs::StatusChangeRequest::SMALL_BUFF);
+  switch_exposure_srv_->setTargetType(rm_msgs::StatusChangeRequest::SMALL_BUFF);
   switch_buff_srv_->callService();
   switch_detection_srv_->callService();
   switch_buff_type_srv_->callService();
   switch_exposure_srv_->callService();
   if (is_gyro_)
-  {
-    if (switch_buff_srv_->getTarget() != rm_msgs::StatusChangeRequest::ARMOR)
-      changeGyroSpeedMode(LOW);
-    else
-      changeGyroSpeedMode(NORMAL);
-  }
-}
-
-void ChassisGimbalShooterCoverManual::cPress()
-{
-  if (is_gyro_)
-  {
-    setChassisMode(rm_msgs::ChassisCmd::FOLLOW);
-  }
-  else
-  {
-    setChassisMode(rm_msgs::ChassisCmd::RAW);
-    chassis_cmd_sender_->power_limit_->updateState(rm_common::PowerLimit::NORMAL);
-    if (switch_buff_srv_->getTarget() != rm_msgs::StatusChangeRequest::ARMOR)
-      changeGyroSpeedMode(LOW);
-    else
-      changeGyroSpeedMode(NORMAL);
-  }
-}
-
-void ChassisGimbalShooterCoverManual::zPress()
-{
+    changeGyroSpeedMode(LOW);
   last_shoot_freq_ = shooter_cmd_sender_->getShootFrequency();
   shooter_cmd_sender_->setShootFrequency(rm_common::HeatLimit::MINIMAL);
 }
 
-void ChassisGimbalShooterCoverManual::zRelease()
+void ChassisGimbalShooterCoverManual::eRelease()
 {
+  ChassisGimbalShooterManual::eRelease();
+  switch_buff_srv_->setTargetType(rm_msgs::StatusChangeRequest::ARMOR);
+  switch_detection_srv_->setTargetType(rm_msgs::StatusChangeRequest::ARMOR);
+  switch_buff_type_srv_->setTargetType(switch_buff_srv_->getTarget());
+  switch_exposure_srv_->setTargetType(rm_msgs::StatusChangeRequest::ARMOR);
+  switch_buff_srv_->callService();
+  switch_detection_srv_->callService();
+  switch_buff_type_srv_->callService();
+  switch_exposure_srv_->callService();
   shooter_cmd_sender_->setShootFrequency(last_shoot_freq_);
+  if (is_gyro_)
+    changeGyroSpeedMode(NORMAL);
+}
+
+void ChassisGimbalShooterCoverManual::bPress()
+{
+  chassis_cmd_sender_->power_limit_->setStartBurstTime(ros::Time::now());
+}
+
+void ChassisGimbalShooterCoverManual::cPress()
+{
+  setChassisMode(rm_msgs::ChassisCmd::RAW);
+  chassis_cmd_sender_->power_limit_->updateState(rm_common::PowerLimit::BURST);
+  if (switch_buff_srv_->getTarget() != rm_msgs::StatusChangeRequest::ARMOR)
+    changeGyroSpeedMode(LOW);
+  else
+    changeGyroSpeedMode(NORMAL);
+}
+
+void ChassisGimbalShooterCoverManual::qPress()
+{
+  setChassisMode(rm_msgs::ChassisCmd::FOLLOW);
+  chassis_cmd_sender_->power_limit_->updateState(rm_common::PowerLimit::NORMAL);
 }
 
 void ChassisGimbalShooterCoverManual::wPress()
@@ -247,18 +329,6 @@ void ChassisGimbalShooterCoverManual::wPress()
 void ChassisGimbalShooterCoverManual::wPressing()
 {
   ChassisGimbalShooterManual::wPressing();
-  if ((ros::Time::now() - last_switch_time_).toSec() > exit_buff_mode_duration_ &&
-      switch_buff_srv_->getTarget() != rm_msgs::StatusChangeRequest::ARMOR)
-  {
-    switch_buff_srv_->setTargetType(rm_msgs::StatusChangeRequest::ARMOR);
-    switch_detection_srv_->setTargetType(rm_msgs::StatusChangeRequest::ARMOR);
-    switch_buff_type_srv_->setTargetType(switch_buff_srv_->getTarget());
-    switch_exposure_srv_->setTargetType(rm_msgs::StatusChangeRequest::ARMOR);
-    switch_buff_srv_->callService();
-    switch_detection_srv_->callService();
-    switch_buff_type_srv_->callService();
-    switch_exposure_srv_->callService();
-  }
   if (switch_buff_srv_->getTarget() != rm_msgs::StatusChangeRequest::ARMOR)
     vel_cmd_sender_->setAngularZVel(is_gyro_ ? gyro_rotate_reduction_ : 0, gyro_speed_limit_);
 }
@@ -326,6 +396,20 @@ void ChassisGimbalShooterCoverManual::ctrlZPress()
   else
   {
     changeSpeedMode(NORMAL);
+  }
+}
+
+void ChassisGimbalShooterCoverManual::ctrlXPress()
+{
+  if (!need_wireless_)
+  {
+    need_wireless_ = true;
+    chassis_cmd_sender_->setWirelessState(true);
+  }
+  else
+  {
+    need_wireless_ = false;
+    chassis_cmd_sender_->setWirelessState(false);
   }
 }
 

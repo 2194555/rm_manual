@@ -62,9 +62,10 @@ protected:
   rm_common::ChassisCommandSender* chassis_cmd_sender_{};
 
   double x_scale_{}, y_scale_{};
-  bool is_gyro_{ 0 };
+  bool is_gyro_{ 0 }, wheels_offline_ = false;
   double speed_change_scale_{ 1. };
   double gimbal_scale_{ 1. };
+  double traj_scale_{ 0.5 };
   double gyro_move_reduction_{ 1. };
   double gyro_rotate_reduction_{ 1. };
   double finish_turning_threshold_{};

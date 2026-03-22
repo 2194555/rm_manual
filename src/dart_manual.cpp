@@ -375,19 +375,6 @@ void DartManual::dartClientCmdCallback(const rm_msgs::DartClientCmd::ConstPtr& d
 
 void DartManual::gameRobotHpCallback(const rm_msgs::GameRobotHp::ConstPtr& data)
 {
-  switch (robot_id_)
-  {
-    case rm_msgs::GameRobotStatus::RED_DART:
-      outpost_hp_ = data->blue_outpost_hp;
-      break;
-    case rm_msgs::GameRobotStatus::BLUE_DART:
-      outpost_hp_ = data->red_outpost_hp;
-      break;
-  }
-  if (outpost_hp_ != 0)
-    auto_state_ = OUTPOST;
-  else
-    auto_state_ = BASE;
 }
 
 void DartManual::wheelClockwise()
